@@ -25,6 +25,8 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
             last_char = getchar();
         }
 
+        // fprintf(stderr, "Read stdin char %c\n", last_char);
+
         if (isalpha(last_char)) { // we're at the start of a word: either keyword or an identifier
             identifier_string = last_char;
             last_char = getchar();
@@ -300,6 +302,7 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         auto args = vector<string>();
         while (curr_token == TOK_IDENTIFIER) {
             args.push_back(identifier_string);
+            get_next_token();
         }
 
         if (curr_token != ')') {
