@@ -6,7 +6,19 @@
 #include <memory>
 #include <vector>
 
-using std::move, std::unique_ptr, std::make_unique, std::string, std::vector;
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+
+using namespace llvm;
 
 namespace { // Unnamed namespace: contents are automatically scoped to this file.
     typedef enum Token {
@@ -18,6 +30,12 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
     } Token;
     std::string identifier_string;
     double number_val = 69;
+
+    // --- LLVM IR static variables ---
+    std::unique_ptr<llvm::LLVMContext> context;
+    std::unique_ptr<IRBuilder<>> builder;
+    std::unique_ptr<llvm::Module> module;
+    std::map<std::string, Value*> named_values;
 
     int get_token() {
         static char last_char = ' '; // only executes on first func call.
@@ -42,7 +60,7 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         }
 
         if (isdigit(last_char)) { // we found a float
-            string num_string;
+            std::string num_string;
             num_string = last_char;
             last_char = getchar();
             while (isdigit(last_char) || last_char == '.') {
@@ -77,11 +95,15 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
     class AstExpr {
         public:
         virtual ~AstExpr() = default;
+        virtual Value* codegen() = 0;
     };
 
     class NumLiteralExpr : public AstExpr {
         public:
-        NumLiteralExpr(double val) : value(val) {}
+        NumLiteralExpr(double val) : value(val) {};
+        Value* codegen()  override {
+            return ConstantFP::get(*context, APFloat(this->value));
+        };
 
         private:
         double value;
@@ -91,6 +113,13 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         public:
         VarExpr(const std::string& name)
             : name(name) {}
+        Value* codegen() override {
+            Value* val = named_values[this->name];
+            if (!val) {
+                return log_error_val(("Attempted access of undefined variable " + this->name).c_str());
+            }
+            return val;
+        }
 
         private:
         std::string name;
@@ -98,11 +127,34 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
 
     class BinaryExpr : public AstExpr {
         public:
-        BinaryExpr(char operand, std::unique_ptr<AstExpr> lhs, std::unique_ptr<AstExpr> rhs)
-            : operand(operand), lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+        BinaryExpr(char kld_op, std::unique_ptr<AstExpr> lhs, std::unique_ptr<AstExpr> rhs)
+            : kld_op(kld_op), lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+        
+        Value* codegen() override {
+            Value* left = lhs->codegen();
+            Value* right = rhs->codegen();
 
+            if (!left || !right) {
+                return nullptr;
+            }
+
+            switch (kld_op) {
+                case '+':
+                    return builder->CreateFAdd(left, right, "addtmp");
+                case '*':
+                    return builder->CreateFMul(left, right, "multmp");
+                case '-':
+                    return builder->CreateFSub(left, right, "subtmp");
+                case '<':
+                    left = builder->CreateFCmpULT(left, right, "cmptmp");
+                    return builder->CreateUIToFP(left, Type::getDoubleTy(context), "booltmp");
+                default:
+                    return log_error_val(("Invalid binary operator '" + kld_op + '\'').c_str());
+            }
+        }
+        
         private:
-        char operand;
+        char kld_op;
         std::unique_ptr<AstExpr> lhs, rhs;
     };
 
@@ -110,6 +162,25 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         public:
         CallExpr(const std::string& callee_name, std::vector<std::unique_ptr<AstExpr>> args)
             : callee_name(callee_name), args(std::move(args)) {}
+
+        Value* codegen() override {
+            Function* callee_func = module->getFunction(callee_name);
+            if (!callee_func) {
+                return log_error_val("Unknown function being called");
+            }
+            if (callee_func->arg_size() != args.size()) {
+                return log_error_val("Wrong number of arguments provided in function call");
+            }
+
+            std::vector<Value*> arg_vals;
+            for (auto arg : args) {
+                arg_vals.push_back(arg);
+                if (!arg_vals.back()) {
+                    return nullptr;
+                }
+            }
+            return builder->CreateCall(callee_func, arg_vals, "calltmp");
+        }
 
         private:
         std::string callee_name;
@@ -125,6 +196,19 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
             return name;
         }
 
+        Function* codegen() override {
+            std::vector<Type*> doubles(arg_names.size(), Type::getDoubleTy(context));
+            FunctionType* type = FunctionType::get(Type::getDoubleTy(context), doubles, false);
+            Function* func = Function::Create(type, Function::ExternalLinkage, name, module.get());
+
+            // set arg names
+            int size = func->args().size();
+            for (int i = 0; i < size; i++) {
+                func->args()[i].setName(arg_names[i]);
+            }
+            return func;
+        }
+
         private:
         std::string name;
         std::vector<std::string> arg_names;
@@ -135,6 +219,36 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         AstFuncDef(std::unique_ptr<AstPrototype> prototype, std::unique_ptr<AstExpr> body)
             : prototype(std::move(prototype)), body(std::move(body)) {}
 
+        Function* codegen() override {
+            Function* func = module.getFunction(proto->get_name());
+
+            if (!func) {
+                func = proto.codegen();
+            }
+            if (!func) {
+                return nullptr;
+            }
+            if (!func.empty()) {
+                return (Function*)log_error_val("Function body already defined.");
+            }
+
+            BasicBlock* block = BasicBlock::Create(*context, "entry", func);
+            builder->SetInsertPoint(block);
+
+            named_values.clear();
+            for (auto &arg : func.args()) {
+                named_values[std::string(arg.getName)] = &arg;
+            }
+
+            Value* body_retval = body->codegen();
+            if (!body_retval) {
+                func.eraseFromParent();
+            }
+            builder->CreateRet(body_retval);
+            verifyFunction(*func);
+            return func;
+        }
+
         private:
         std::unique_ptr<AstPrototype> prototype;
         std::unique_ptr<AstExpr> body;
@@ -142,7 +256,7 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
 
 
     // --- Parsing Helpers ---
-    unique_ptr<AstExpr> parse_expr();
+    std::unique_ptr<AstExpr> parse_expr();
 
     int curr_token = -69;
     int get_next_token() {
@@ -160,6 +274,11 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
     }
 
     std::unique_ptr<AstPrototype> log_error_proto(const char* const msg) {
+        log_error(msg);
+        return nullptr;
+    }
+
+    llvm::Value* log_error_val(const char* const msg) {
         log_error(msg);
         return nullptr;
     }
@@ -246,7 +365,7 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         }
     }
 
-    unique_ptr<AstExpr> parse_bin_op_rhs(int lhs_prec, unique_ptr<AstExpr> lhs) {
+    std::unique_ptr<AstExpr> parse_bin_op_rhs(int lhs_prec, std::unique_ptr<AstExpr> lhs) {
         // so basically we need to call this recursively, until the next call says it can't run because its precedence is lower than
         // the precedence of this call's operator. only then can we evaluate the current BinaryExpr and return it.
         while (true) {
@@ -274,14 +393,14 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
                 }
             }
 
-            lhs = make_unique<BinaryExpr>(op, move(lhs), move(rhs));
+            lhs = std::make_unique<BinaryExpr>(op, move(lhs), move(rhs));
         }
     }
     
     /**
      * An expression consists of an LHS primary expression, optionally followed by a binary operator and an RHS primary expression.
     */
-    unique_ptr<AstExpr> parse_expr() {
+    std::unique_ptr<AstExpr> parse_expr() {
         auto lhs = parse_primary();
         if (!lhs) {
             return nullptr;
@@ -289,9 +408,9 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         return parse_bin_op_rhs(0, move(lhs));
     }
 
-    unique_ptr<AstPrototype> parse_prototype() {
+    std::unique_ptr<AstPrototype> parse_prototype() {
         assert(curr_token == TOK_IDENTIFIER);
-        string func_name = identifier_string;
+        std::string func_name = identifier_string;
         get_next_token();
 
         if (curr_token != '(') {
@@ -299,7 +418,7 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         }
         get_next_token();
 
-        auto args = vector<string>();
+        auto args = std::vector<std::string>();
         while (curr_token == TOK_IDENTIFIER) {
             args.push_back(identifier_string);
             get_next_token();
@@ -310,10 +429,10 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         }
         get_next_token();
 
-        return make_unique<AstPrototype>(func_name, move(args));
+        return std::make_unique<AstPrototype>(func_name, move(args));
     }
 
-    unique_ptr<AstFuncDef> parse_definition() {
+    std::unique_ptr<AstFuncDef> parse_definition() {
         assert(curr_token == TOK_DEF);
         get_next_token();
 
@@ -327,10 +446,10 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
             return nullptr;
         }
 
-        return make_unique<AstFuncDef>(move(proto), move(body));
+        return std::make_unique<AstFuncDef>(move(proto), move(body));
     }
 
-    unique_ptr<AstPrototype> parse_extern() {
+    std::unique_ptr<AstPrototype> parse_extern() {
         assert(curr_token == TOK_EXTERN);
         get_next_token();
 
@@ -340,16 +459,18 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
     /**
      * We handle top level expressions by parsing them as anonymous (unnamed) unary (no argument) functions
     */
-    unique_ptr<AstFuncDef> parse_top_level_expr() {
+    std::unique_ptr<AstFuncDef> parse_top_level_expr() {
         auto expr = parse_expr();
         if (!expr) {
             return nullptr;
         }
 
-        auto proto = make_unique<AstPrototype>("", vector<string>());
+        auto proto = std::make_unique<AstPrototype>("", std::vector<std::string>());
         assert(proto);
-        return make_unique<AstFuncDef>(move(proto), move(expr));
+        return std::make_unique<AstFuncDef>(std::move(proto), move(expr));
     }
+
+
 
     // --- Handlers for main loop, for now they just print what they found
     void handle_definition() {
