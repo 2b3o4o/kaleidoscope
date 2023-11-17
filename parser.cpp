@@ -37,6 +37,9 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
     std::unique_ptr<llvm::Module> module;
     std::map<std::string, Value*> named_values;
 
+    // decls
+    llvm::Value* log_error_val(const char* const msg);
+
     int get_token() {
         static char last_char = ' '; // only executes on first func call.
         while (isspace(last_char)) {
@@ -147,9 +150,9 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
                     return builder->CreateFSub(left, right, "subtmp");
                 case '<':
                     left = builder->CreateFCmpULT(left, right, "cmptmp");
-                    return builder->CreateUIToFP(left, Type::getDoubleTy(context), "booltmp");
+                    return builder->CreateUIToFP(left, Type::getDoubleTy(*context), "booltmp");
                 default:
-                    return log_error_val(("Invalid binary operator '" + kld_op + '\'').c_str());
+                    return log_error_val(std::string("Invalid binary operator '").append(1, kld_op).append(1, '\'').c_str());
             }
         }
         
@@ -173,8 +176,8 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
             }
 
             std::vector<Value*> arg_vals;
-            for (auto arg : args) {
-                arg_vals.push_back(arg);
+            for (auto& arg : args) {
+                arg_vals.push_back(arg->codegen());
                 if (!arg_vals.back()) {
                     return nullptr;
                 }
@@ -196,16 +199,18 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
             return name;
         }
 
-        Function* codegen() override {
-            std::vector<Type*> doubles(arg_names.size(), Type::getDoubleTy(context));
-            FunctionType* type = FunctionType::get(Type::getDoubleTy(context), doubles, false);
+        Function* codegen() {
+            std::vector<Type*> doubles(arg_names.size(), Type::getDoubleTy(*context));
+            FunctionType* type = FunctionType::get(Type::getDoubleTy(*context), doubles, false);
             Function* func = Function::Create(type, Function::ExternalLinkage, name, module.get());
 
             // set arg names
-            int size = func->args().size();
-            for (int i = 0; i < size; i++) {
-                func->args()[i].setName(arg_names[i]);
+            int index = 0;
+            for (auto& arg : func->args()) {
+                arg.setName(arg_names[index]);
+                index++;
             }
+
             return func;
         }
 
@@ -219,16 +224,16 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         AstFuncDef(std::unique_ptr<AstPrototype> prototype, std::unique_ptr<AstExpr> body)
             : prototype(std::move(prototype)), body(std::move(body)) {}
 
-        Function* codegen() override {
-            Function* func = module.getFunction(proto->get_name());
+        Function* codegen() {
+            Function* func = module->getFunction(prototype->get_name());
 
             if (!func) {
-                func = proto.codegen();
+                func = prototype->codegen();
             }
             if (!func) {
                 return nullptr;
             }
-            if (!func.empty()) {
+            if (!func->empty()) {
                 return (Function*)log_error_val("Function body already defined.");
             }
 
@@ -236,13 +241,14 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
             builder->SetInsertPoint(block);
 
             named_values.clear();
-            for (auto &arg : func.args()) {
-                named_values[std::string(arg.getName)] = &arg;
+            for (auto &arg : func->args()) {
+                named_values[std::string(arg.getName())] = &arg;
             }
 
             Value* body_retval = body->codegen();
             if (!body_retval) {
-                func.eraseFromParent();
+                func->eraseFromParent();
+                return nullptr;
             }
             builder->CreateRet(body_retval);
             verifyFunction(*func);
@@ -470,7 +476,12 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         return std::make_unique<AstFuncDef>(std::move(proto), move(expr));
     }
 
+    void init_llvm_module() {
+        context = std::make_unique<LLVMContext>();
+        module = std::make_unique<Module>("cool jit module", *context);
+        builder = std::make_unique<IRBuilder<>>(*context);
 
+    }
 
     // --- Handlers for main loop, for now they just print what they found
     void handle_definition() {
@@ -481,6 +492,10 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
             return;
         }
         fprintf(stderr, "Found a definition!\n");
+        auto* func = def->codegen();
+        if (func) {
+            func->print(errs());
+        }
     }
 
     void handle_extern() {
@@ -491,6 +506,10 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
             return;
         }
         fprintf(stderr, "Found a extern!\n");
+        auto* func = decl->codegen();
+        if (func) {
+            func->print(errs());
+        }
     }
 
     void handle_top_level_expr() {
@@ -501,10 +520,15 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
             return;
         }
         fprintf(stderr, "Found a top level expression!\n");
+        auto* func = expr->codegen();
+        if (func) {
+            func->print(errs());
+        }
     }
 }
 
 int main() {
+    init_llvm_module();
     get_next_token();
     while (true) {
         switch (curr_token) {
