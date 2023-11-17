@@ -2,7 +2,7 @@
 CXX=clang++
 
 # Define compiler flags, including those from llvm-config
-CXXFLAGS=-g -O0 -fuse-ld=lld `llvm-config --cxxflags --ldflags --system-libs --libs core`
+CXXFLAGS=-g -O0 -fuse-ld=lld `llvm-config --cxxflags --ldflags --system-libs --libs core orcjit native`
 
 # Define the target executable
 TARGET=parser

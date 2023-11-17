@@ -15,10 +15,21 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 
 using namespace llvm;
+// using namespace llvm::orc;
 
 namespace { // Unnamed namespace: contents are automatically scoped to this file.
     typedef enum Token {
@@ -36,6 +47,14 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
     std::unique_ptr<IRBuilder<>> builder;
     std::unique_ptr<llvm::Module> module;
     std::map<std::string, Value*> named_values;
+
+    std::unique_ptr<FunctionPassManager> fp_mgr;
+    std::unique_ptr<LoopAnalysisManager> la_mgr;
+    std::unique_ptr<FunctionAnalysisManager> fa_mgr;
+    std::unique_ptr<CGSCCAnalysisManager> cga_mgr;
+    std::unique_ptr<ModuleAnalysisManager> ma_mgr;
+    std::unique_ptr<PassInstrumentationCallbacks> pi_cllb;
+    std::unique_ptr<StandardInstrumentations> std_instrs;
 
     // decls
     llvm::Value* log_error_val(const char* const msg);
@@ -252,6 +271,7 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
             }
             builder->CreateRet(body_retval);
             verifyFunction(*func);
+            fp_mgr->run(*func, *fa_mgr);
             return func;
         }
 
@@ -481,6 +501,25 @@ namespace { // Unnamed namespace: contents are automatically scoped to this file
         module = std::make_unique<Module>("cool jit module", *context);
         builder = std::make_unique<IRBuilder<>>(*context);
 
+        // pass and analysis managers:
+        fp_mgr = std::make_unique<FunctionPassManager>();
+        la_mgr = std::make_unique<LoopAnalysisManager>();
+        fa_mgr = std::make_unique<FunctionAnalysisManager>();
+        cga_mgr = std::make_unique<CGSCCAnalysisManager>();
+        ma_mgr = std::make_unique<ModuleAnalysisManager>();
+        pi_cllb = std::make_unique<PassInstrumentationCallbacks>();
+        std_instrs = std::make_unique<StandardInstrumentations>(*context, /*DebugLogging*/ true);
+        std_instrs->registerCallbacks(*pi_cllb, ma_mgr.get());
+
+        fp_mgr->addPass(InstCombinePass());
+        fp_mgr->addPass(ReassociatePass());
+        fp_mgr->addPass(GVNPass());
+        fp_mgr->addPass(SimplifyCFGPass());
+
+        PassBuilder pb;
+        pb.registerModuleAnalyses(*ma_mgr);
+        pb.registerFunctionAnalyses(*fa_mgr);
+        pb.crossRegisterProxies(*la_mgr, *fa_mgr, *cga_mgr, *ma_mgr);
     }
 
     // --- Handlers for main loop, for now they just print what they found
